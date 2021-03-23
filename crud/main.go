@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"time"
 	"strconv"
+	"github.com/lestrrat-go/jwx/jwt"
+	"github.com/lestrrat-go/jwx/jwa"
 )
 
 var db *pgxpool.Pool
@@ -44,21 +46,87 @@ func main() {
 	}
 }
 
+func isAdmin (next func(w http.ResponseWriter, r *http.Request)) func (w http.ResponseWriter, r *http.Request){
+	return func(w http.ResponseWriter, r *http.Request) {
+		// validate user token
+		token, err := jwt.ParseHeader(r.Header, "Authorization", jwt.WithVerify(jwa.HS256, []byte("mysecretkey")))
+		if err != nil {
+			fmt.Printf("unauthorized access: %v\n", err)
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte("unauthorized"))
+			return
+		}
+
+		err = jwt.Validate(token)
+		if err != nil {
+			fmt.Printf("unauthorized access: %v\n", err)
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte("unauthorized"))
+			return
+		}
+
+		pclaims := token.PrivateClaims()
+		admin := pclaims["admin"].(bool)
+
+		if (!admin) {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte("unauthorized, not admin"))
+			return
+		}
+		// if valid
+		next(w,r)
+	}
+}
+
 func apiRouter(r chi.Router) {
+	r.Post("/authenticate", authenticateUser)
 	r.Route("/articles", articlesRouter)
 }
 
 func articlesRouter(r chi.Router) {
 	// /api/articles
+	
 	r.Get("/", listArticles)
-	r.Post("/", createArticle)
-	r.Put("/{id}", updateArticle)
-	r.Delete("/{id}", deleteArticle)
+	r.Post("/", isAdmin(createArticle))
+	r.Put("/{id}", isAdmin(updateArticle))
+	r.Delete("/{id}", isAdmin(deleteArticle))
 }
 
 func printError(w http.ResponseWriter, err error) {
 	w.WriteHeader(http.StatusInternalServerError)
 	w.Write([]byte(err.Error()))
+}
+
+func authenticateUser(w http.ResponseWriter, r *http.Request) {
+	username_form := r.FormValue("username")
+	password_form := r.FormValue("password")
+
+	fmt.Println(username_form)
+	fmt.Println(password_form)
+	row := db.QueryRow(context.Background(), "SELECT id, username, admin FROM api.users WHERE username=$1 and password=$2", username_form, password_form)
+	var (
+		id int
+		username string
+		admin bool
+	)
+	
+	err := row.Scan(&id, &username, &admin)
+	if err != nil {
+		printError(w, err)
+		return
+	}
+
+	token := jwt.New()
+	token.Set(jwt.ExpirationKey, time.Now().Add(time.Minute).Unix())
+	token.Set("id", id)
+	token.Set("username", username)
+	token.Set("admin", admin)
+	tb, err := jwt.Sign(token, jwa.HS256, []byte("mysecretkey"))
+	if err != nil {
+		printError(w, err)
+		return
+	}
+	w.Write(tb)
 }
 
 func listArticles(w http.ResponseWriter, r *http.Request) {
